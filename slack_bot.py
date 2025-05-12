@@ -3,7 +3,8 @@ import logging
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from dotenv import load_dotenv
-from collections import defaultdict
+from database import TaskDatabase
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -19,10 +20,8 @@ load_dotenv()
 # Initialize the Slack app
 app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
 
-# In-memory task storage
-# Format: {user_id: {task_id: {"text": task_text, "shared_with": [user_ids]}}}
-tasks = defaultdict(dict)
-task_counter = 0
+# Initialize database
+db = TaskDatabase()
 
 def get_user_info(user_id):
     try:
@@ -64,19 +63,39 @@ def get_channel_info(channel_id):
     return channel_id
 
 def format_tasks(user_id):
-    if not tasks[user_id]:
-        return "No tasks yet. Add some tasks to get started!"
-    
-    task_list = []
-    for task_id, task_info in tasks[user_id].items():
-        shared_with = task_info.get("shared_with", [])
-        shared_text = ""
-        if shared_with:
-            shared_names = [get_user_info(user).split(" (")[0] for user in shared_with]
-            shared_text = f" (shared with {', '.join(shared_names)})"
-        task_list.append(f"• {task_info['text']}{shared_text}")
-    
-    return "\n".join(task_list)
+    try:
+        tasks = db.get_tasks(user_id)
+        
+        if not tasks['own_tasks'] and not tasks['shared_tasks']:
+            return "No tasks yet. Add some tasks to get started!"
+        
+        message_parts = []
+        
+        # Format own tasks
+        if tasks['own_tasks']:
+            message_parts.append("*Your Tasks:*")
+            for task in tasks['own_tasks']:
+                task_id, text, completed, created_at, shared_with = task
+                status = "✅" if completed else "🚧"
+                shared_text = ""
+                if shared_with:
+                    shared_names = [get_user_info(user).split(" (")[0] for user in shared_with.split(",")]
+                    shared_text = f" (shared with {', '.join(shared_names)})"
+                message_parts.append(f"{status} {text} (ID: {task_id}){shared_text}")
+        
+        # Format shared tasks
+        if tasks['shared_tasks']:
+            message_parts.append("\n*Tasks Shared With You:*")
+            for task in tasks['shared_tasks']:
+                task_id, text, completed, created_at, owner_id, shared_with = task
+                status = "✅" if completed else "🚧"
+                owner_name = get_user_info(owner_id).split(" (")[0]
+                message_parts.append(f"{status} {text} (ID: {task_id}, from {owner_name})")
+        
+        return "\n".join(message_parts)
+    except Exception as e:
+        logger.error(f"Error formatting tasks: {e}")
+        return "Error retrieving tasks. Please try again."
 
 # Event handler for when the bot is mentioned
 @app.event("app_mention")
@@ -128,21 +147,27 @@ def handle_tasks_command(ack, body, say):
 
 # Command handler for /addtask command
 @app.command("/addtask")
-def handle_add_task(ack, body, say):
+def handle_add_task(ack, command, body, logger):
+    ack()
     try:
+        # Log the raw message body
+        logger.info(f"📦 Raw Slack message body: {json.dumps(body, indent=2)}")
+        
         user_id = body['user_id']
-        text = body['text']
+        text = command['text']
         
+        if not text:
+            ack("Please provide a task description. Example: `/addtask Buy groceries`")
+            return
+        
+        task_id = db.add_task(user_id, text)
+        user_info = get_user_info(user_id)
+        logger.info(f"📝 New task added by {user_info}: '{text}' (ID: {task_id})")
         ack()
-        
-        global task_counter
-        task_counter += 1
-        tasks[user_id][task_counter] = {"text": text, "shared_with": []}
-        
-        say(f"Task added! Use `/tasks` to see your tasks.")
+        say(f"Task added! (ID: {task_id}) Use `/tasks` to see your tasks.")
         
     except Exception as e:
-        logger.error(f"Error in handle_add_task: {e}")
+        logger.error(f"❌ Error in handle_add_task: {e}")
         try:
             ack()
         except:
@@ -159,24 +184,88 @@ def handle_share_task(ack, body, say):
             ack("Please provide a task number and user to share with. Example: `/sharetask 1 @username`")
             return
             
-        task_id = int(args[0])
-        user_to_share = args[1].strip('<>@')
-        
-        if task_id not in tasks[user_id]:
-            ack(f"Task {task_id} not found. Use `/tasks` to see your tasks.")
+        try:
+            task_id = int(args[0])
+        except ValueError:
+            ack("Please provide a valid task number.")
             return
             
-        if "shared_with" not in tasks[user_id][task_id]:
-            tasks[user_id][task_id]["shared_with"] = []
-            
-        if user_to_share not in tasks[user_id][task_id]["shared_with"]:
-            tasks[user_id][task_id]["shared_with"].append(user_to_share)
-            
-        ack()
-        say(f"Task shared with <@{user_to_share}>!")
+        user_to_share = args[1].strip('<>@')
+        
+        if db.share_task(task_id, user_id, user_to_share):
+            ack()
+            say(f"Task shared with <@{user_to_share}>!")
+        else:
+            ack("Task not found or you don't have permission to share it.")
         
     except Exception as e:
         logger.error(f"Error in handle_share_task: {e}")
+        try:
+            ack()
+        except:
+            pass
+
+# Command handler for /completetask command
+@app.command("/completetask")
+def handle_complete_task(ack, body, say):
+    try:
+        user_id = body['user_id']
+        args = body['text'].split()
+        
+        if not args:
+            ack("Please provide a task number. Example: `/completetask 1`")
+            return
+            
+        try:
+            task_id = int(args[0])
+        except ValueError:
+            ack("Please provide a valid task number.")
+            return
+        
+        if db.complete_task(task_id, user_id):
+            user_info = get_user_info(user_id)
+            logger.info(f"✅ Task {task_id} marked as completed by {user_info}")
+            ack()
+            say(f"Task marked as completed! Use `/tasks` to see your updated task list.")
+        else:
+            logger.warning(f"⚠️ Failed to complete task {task_id} - Not found or no permission")
+            ack("Task not found or you don't have permission to complete it.")
+        
+    except Exception as e:
+        logger.error(f"❌ Error in handle_complete_task: {e}")
+        try:
+            ack()
+        except:
+            pass
+
+# Command handler for /deletetask command
+@app.command("/deletetask")
+def handle_delete_task(ack, body, say):
+    try:
+        user_id = body['user_id']
+        args = body['text'].split()
+        
+        if not args:
+            ack("Please provide a task number. Example: `/deletetask 1`")
+            return
+            
+        try:
+            task_id = int(args[0])
+        except ValueError:
+            ack("Please provide a valid task number.")
+            return
+        
+        if db.delete_task(task_id, user_id):
+            user_info = get_user_info(user_id)
+            logger.info(f"🗑️ Task {task_id} deleted by {user_info}")
+            ack()
+            say(f"Task deleted! Use `/tasks` to see your updated task list.")
+        else:
+            logger.warning(f"⚠️ Failed to delete task {task_id} - Not found or no permission")
+            ack("Task not found or you don't have permission to delete it.")
+        
+    except Exception as e:
+        logger.error(f"❌ Error in handle_delete_task: {e}")
         try:
             ack()
         except:
