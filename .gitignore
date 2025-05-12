@@ -18,4 +18,5 @@ ENV/
 
 # OS
 .DS_Store
-Thumbs.db tasks.db
+Thumbs.db 
+tasks.db
